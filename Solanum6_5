@@ -1,0 +1,498 @@
+from pybricks.hubs import PrimeHub
+from pybricks.pupdevices import Motor, ColorSensor, UltrasonicSensor
+from pybricks.parameters import Color, Direction, Port, Stop
+from pybricks.robotics import DriveBase
+from pybricks.tools import wait, StopWatch
+from umath import degrees, atan, atan2
+
+# ========== CONSTANTES ==============================================================================
+DEBUG = False  # Ative/desative mensagens de debug
+
+# Configuração Física
+DIAMETRO_RODA = 24.5
+ENTRE_EIXOS = 110
+VELOCIDADE_GARRA = 300
+RANGE_GARRA = 600
+
+# Parâmetros PID
+PID_KP = 6.9
+PID_KI = 0.0013
+PID_KD = 4.2
+VEL_BASE = 200
+VEL_MAXIMA = 400
+VEL_MINIMA = 50
+
+# Limites de Detecção
+ZONA_MORTA = 5
+LIMITE_PRATA = 100
+PRATA_RANGE_H = range(204, 212)  # Faixa de hue para prata
+LIMITE_VERDE = 170
+
+# Temporizadores
+TEMPO_PID = 900
+TEMPO_VERDE = 200
+TEMPO_PRATA = 215
+TEMPO_RAMPA = 8000
+
+
+# ========== INICIALIZAÇÃO ===========================================================================
+hub = PrimeHub()
+
+sensor_esq = ColorSensor(Port.E)
+sensor_dir = ColorSensor(Port.F)
+sensor_ultra = UltrasonicSensor(Port.D)
+
+motor_esq = Motor(Port.B, Direction.CLOCKWISE)
+motor_dir = Motor(Port.A, Direction.COUNTERCLOCKWISE)
+garra = Motor(Port.C)
+
+drive = DriveBase(motor_esq, motor_dir, DIAMETRO_RODA, ENTRE_EIXOS)
+drive.settings(straight_speed=VEL_MAXIMA, straight_acceleration=400)
+
+# ========== VARIÁVEIS GLOBAIS =======================================================================
+virando = False
+resgate = False
+subindo_rampa = False
+
+soma_pid = 0
+erro_anterior = 0
+
+verde_esq = 0
+verde_dir = 0
+prata_esq = 0
+prata_dir = 0
+tilt = 0
+
+temporizador_pid = StopWatch()
+temporizador_prata = StopWatch()
+temporizador_verde = StopWatch()
+temporizador_rampa = StopWatch()
+
+# ========== FUNÇÕES AUXILIARES ======================================================================
+def girar(angulo_alvo, reset=False, velocidade=300):
+    if reset:
+        hub.imu.reset_heading(0)
+    while True:
+        erro = angulo_alvo - hub.imu.heading()
+        if abs(erro) < 2:
+            break
+        if erro > 0:
+            motor_esq.run(velocidade)
+            motor_dir.run(-velocidade)
+        else:
+            motor_esq.run(-velocidade)
+            motor_dir.run(velocidade)
+    motor_esq.stop()
+    motor_dir.stop()
+
+def media_sensor(sensor, tipo='r', amostras=5, intervalo=20):
+    leitor = {
+        's': lambda s: s.hsv(True).s,
+        'r': lambda s: s.reflection(),
+        'h': lambda s: s.hsv(True).h
+    }[tipo]
+    total = 0
+    for _ in range(amostras):
+        total += leitor(sensor)
+        wait(intervalo) 
+    
+    return total / amostras
+
+def pid_ajuste(erro, delta_erro, reflexao_media):
+    kp = PID_KP
+    ki = PID_KI
+    kd = PID_KD
+
+    if abs(erro) > 30:
+        kp += 1.5
+        kd += 1.8
+    elif abs(erro) < 10:
+        kp -= 1.0
+        kd -= 1.5
+        ki += 0.0007
+
+    if abs(delta_erro) > 20:
+        kd += 1.5
+
+    if reflexao_media < 30:
+        kp *= 1.1
+    elif reflexao_media > 60:
+        kp *= 0.8
+        kd *= 1.2
+
+    return kp, ki, kd
+
+def resetar_estado():
+    global resgate, subindo_rampa, soma_pid, erro_anterior, virando
+    resgate = False
+    subindo_rampa = False
+    soma_pid = 0
+    erro_anterior = 0
+    virando = False
+
+    temporizador_pid.reset()
+    temporizador_verde.reset()
+    temporizador_prata.reset()
+    temporizador_rampa.reset()
+
+def loop_principal():
+    global resgate
+
+    while True:
+        main()
+        if resgate:  
+            resgate90()
+            varredura()
+            deposito()
+            saida()
+            resetar_estado()
+
+class saida_encontrada(Exception):
+    pass
+
+# ========== FUNÇÕES RESGATE ==========================================================================
+def resgate90():
+    global largura, altura, triangulos
+    largura = 900
+    altura = 900
+    drive.straight(440, Stop.HOLD, True)
+    girar(-90, True) # DEPENDE DO LADO DA ARENA
+    drive.straight(-300, Stop.HOLD, True) # CASO ESTEJA NO MEIO
+    drive.straight(380, Stop.HOLD, True)
+    
+    #PROCURA DOS TRIANGULOS
+    angulos = [45, 135, 225, 315]
+    triangulos = []
+    hub.imu.reset_heading(0)
+    for c in angulos: 
+            girar(c)
+            wait(1000)
+            triangulos.append(sensor_ultra.distance())
+    girar(90)
+    
+    #DEFINIÇÂO DOS TRIANGULOS
+    menores = []
+    copia = triangulos[:]
+    for _ in range(2):
+        menor = min(copia)
+        menores.append(menor)
+        copia[copia.index(menor)] = float('inf')
+    a = menores[0]
+    b = menores[1]
+    
+def saida():
+    global altura, largura
+    faixasL = largura // 225
+    faixasA = altura // 225
+    def girar_sr(novo_angulo):
+        nonlocal angulo_alvo
+        angulo_alvo += novo_angulo
+        girar(angulo_alvo, False)
+
+    try:
+        if sensor_ultra.distance() >= 700:
+            verificação_saida()
+        girar_sr(180, True)
+        if sensor_ultra.distance() >= 700:
+            verificação_saida()
+        girar_sr(90, True)
+        drive.straight(-800, Stop.HOLD, True)
+        drive.straight(10, Stop.HOLD, True)
+        for c in range(faixasA):
+            girar_sr(90, True)
+            if sensor_ultra.distance() >= 700:
+                verificação_saida()
+            girar_sr(180, True)
+            if sensor_ultra.distance() >= 700:
+                verificação_saida()
+            girar_sr(90, True)
+            drive.straight(225, Stop.HOLD, True)
+        drive.straight(-largura/2 + 90, Stop.HOLD, True)
+        girar_sr(90, True)
+        drive.straight(-800, Stop.HOLD, True)
+        for c in range(faixasL):
+            girar_sr(90, True)
+            if sensor_ultra.distance() >= 700:
+                verificação_saida()
+            girar_sr(180, True)
+            if sensor_ultra.distance() >= 700:
+                verificação_saida()
+            girar_sr(90, True)
+            drive.straight(225, Stop.HOLD, True)
+    except saida_encontrada:
+        return
+        
+def verificação_saida():
+    drive.reset(0)
+    while not sensor_dir.reflection() <= 50 or sensor_esq.reflection() <= 50:
+        drive.straight(10000, Stop.HOLD, False)
+        if sensor_ultra.distance() <= 450:
+            break
+    if media_sensor(sensor_dir, "r", 10, 10) <= 30 or sensor_esq.reflection() <= 30:
+        raise saida_encontrada()
+    else:
+        drive.straight(-drive.distance(), Stop.HOLD, True)
+
+def varredura():
+    global largura, altura, triangulos
+    garra.run_angle(-VELOCIDADE_GARRA, RANGE_GARRA, Stop.HOLD, True)
+
+    meia_largura = largura/2 - 210
+    meia_altura = altura/2 - 210
+
+    #FRENTE
+    drive.straight(meia_altura - 80, Stop.HOLD, True)
+    garra.run_angle(VELOCIDADE_GARRA, RANGE_GARRA, Stop.HOLD, True)
+    #girar(90)
+    #garra.run_angle(-VELOCIDADE_GARRA, RANGE_GARRA, Stop.HOLD, True)
+    #drive.straight(80)
+
+    if a == triangulos[0] or b == triangulos[0]:
+        girar(90)
+        if largura > 1000:
+            drive.straight(largura - 650)
+        garra.run_angle(-VELOCIDADE_GARRA, RANGE_GARRA, Stop.HOLD, True)
+        drive.straight(70, Stop.HOLD, True)
+        girar(37)
+        drive.straight(240, Stop.HOLD, True)
+        girar(59)
+
+    else:
+        drive.straight(130)
+        girar(90)
+        garra.run_angle(-VELOCIDADE_GARRA, RANGE_GARRA, Stop.HOLD, True)
+        drive.straight(meia_largura - 20)
+        garra.run_angle(VELOCIDADE_GARRA, RANGE_GARRA, Stop.HOLD, True)
+        girar(90)
+        garra.run_angle(-VELOCIDADE_GARRA, RANGE_GARRA, Stop.HOLD, True)
+        drive.straight(meia_altura + 40, Stop.HOLD, True)
+
+    if a == triangulos[1] or b == triangulos[1]:
+        if altura >=1000:
+            drive.straight(altura - 650)
+        else:
+            girar(37)
+            drive.straight(240, Stop.HOLD, True)
+            girar(59)
+        
+    else:
+        drive.straight(meia_altura - 50)
+        garra.run_angle(VELOCIDADE_GARRA, RANGE_GARRA, Stop.HOLD, True)
+        drive.straight(55, Stop.HOLD, True)
+        girar(91)
+        garra.run_angle(-VELOCIDADE_GARRA, RANGE_GARRA, Stop.HOLD, True)
+        drive.straight(130, Stop.HOLD, True)
+
+
+    if a == triangulos[2] or b == triangulos[2]:
+        if largura >= 1000:
+            drive.straight(largura - 650)
+        else:
+            drive.straight(meia_largura - 155)
+            girar(40)
+            drive.straight(270, Stop.HOLD, True)
+            girar(52)
+
+    else:
+        drive.straight(meia_largura + 50)
+        garra.run_angle(VELOCIDADE_GARRA, RANGE_GARRA, Stop.HOLD, True)
+        drive.straight(30, Stop.HOLD, True)
+        girar(92)
+        garra.run_angle(-VELOCIDADE_GARRA, RANGE_GARRA, Stop.HOLD, True)
+        drive.straight(205, Stop.HOLD, True)
+
+
+    if a == triangulos[3] or b == triangulos[3]:
+        if largura >= 1000:
+            drive.straight(altura - 650)
+        else:
+            drive.straight(meia_altura - 150)
+            girar(45)
+            drive.straight(260, Stop.HOLD, True)
+            girar(47)
+            garra.run_angle(VELOCIDADE_GARRA, RANGE_GARRA, Stop.HOLD, True)
+            drive.straight(70, Stop.HOLD, True)
+            girar(90)
+            garra.run_angle(-VELOCIDADE_GARRA, RANGE_GARRA, Stop.HOLD, True)
+
+            
+    else:
+        drive.straight(meia_altura - 25)
+        garra.run_angle(300, 490, Stop.HOLD, True)
+        drive.straight(35, Stop.HOLD, True)
+        girar(90)
+        garra.run_angle(-VELOCIDADE_GARRA, RANGE_GARRA, Stop.HOLD, True)
+        drive.straight(215, Stop.HOLD, True)
+        girar(90)
+        drive.straight(90)
+
+def deposito():
+    global altura
+    if a == 0 or b == 0:
+        if altura >= 1000:
+            drive.straight(meia_altura + 180)
+        drive.straight(meia_altura, Stop.HOLD, True)
+        girar(angulo)
+        drive.straight(-600, Stop.HOLD, True)
+        drive.straight(300, Stop.HOLD, True)
+        girar(angulo + 90)
+    elif a == 3 or b == 3:
+        if altura >= 1000:
+            drive.straight(meia_altura + 180)
+        drive.straight(meia_altura)
+        girar(-angulo)
+        drive.straight(-600, Stop.HOLD, True)
+        drive.straight(300, Stop.HOLD, True)
+        girar(-angulo)
+        girar(-90)
+    else:                                
+        if altura >= 1000:
+            drive.straight(meia_altura + 180)
+        drive.straight(meia_altura)
+        girar(angulo + 180)
+        drive.straight(-600, Stop.HOLD, True)
+        drive.straight(300, Stop.HOLD, True)
+        girar(-angulo)
+        garra.run_angle(300, 700, Stop.HOLD, True)
+                 
+# ========== LÓGICA PRINCIPAL =========================================================================
+def main():
+    global soma_pid, erro_anterior, verde_esq, verde_dir, prata_esq, prata_dir, virando, resgate, subindo_rampa, tilt
+
+    while not resgate:
+        # ========== TEMPORIZADORES ==========
+        if temporizador_pid.time() >= TEMPO_PID:
+            soma_pid = 0
+            virando = False
+            temporizador_pid.reset()
+
+        if temporizador_verde.time() >= TEMPO_VERDE:
+            verde_esq = verde_dir = 0
+            temporizador_verde.reset()
+
+        if temporizador_prata.time() >= TEMPO_PRATA:
+            prata_esq = prata_dir = 0
+            tilt = 0
+            temporizador_prata.reset()
+
+        if temporizador_rampa.time() >= TEMPO_RAMPA:
+            subindo_rampa = False
+            temporizador_rampa.reset()
+
+        # ========== LEITURAS ==========
+        color_esq = sensor_esq.color()
+        color_dir = sensor_dir.color()
+        refle_esq = sensor_esq.reflection()
+        refle_dir = sensor_dir.reflection()
+        distancia_ultra = sensor_ultra.distance()
+        hdireito = sensor_dir.hsv().h
+        hesquerdo = sensor_esq.hsv().h
+        tilt_x, _ = hub.imu.tilt()
+
+        # ========== PID ==========
+        erro = refle_dir - refle_esq
+        if abs(erro) > ZONA_MORTA:
+            soma_pid += erro
+        delta_erro = erro - erro_anterior
+        reflexao_media = (refle_esq + refle_dir) / 2
+        kp, ki, kd = pid_ajuste(erro, delta_erro, reflexao_media)
+        pid = (kp * erro) + (ki * soma_pid) + (kd * delta_erro)
+        erro_anterior = erro
+
+        erro_normalizado = min(abs(erro) / 50, 1)
+        velocidade = VEL_MAXIMA - (VEL_MAXIMA - VEL_MINIMA) * erro_normalizado
+
+        if tilt_x <= -20:
+            tilt += 1
+        
+        if tilt >= 10:
+            if DEBUG:
+                print(tilt)
+            subindo_rampa = True
+
+        motor_esq.run(velocidade - pid)
+        motor_dir.run(velocidade + pid)
+
+        # ========== DETECÇÃO DE VERDE ==========
+        if color_esq == Color.GREEN:
+            verde_esq += 1
+        if color_dir == Color.GREEN:
+            verde_dir += 1
+
+        if verde_esq >= LIMITE_VERDE or verde_dir >= LIMITE_VERDE:
+            drive.straight(-20)
+            wait(100)
+            if refle_dir <= 15 or refle_esq <= 15:
+                if color_dir == Color.GREEN and not virando:
+                    virando = True
+                    drive.turn(-20)
+                    drive.straight(60)
+                elif color_esq == Color.GREEN and not virando:
+                    virando = True
+                    drive.turn(10)
+                    drive.straight(60)
+            else:
+                while True:
+                    drive.straight(1000, Stop.HOLD, wait=False)
+                    if verde_dir >= LIMITE_VERDE - 80 and verde_esq >= LIMITE_VERDE - 80 and not virando:
+                        drive.turn(60)
+                        virando = True
+                        while sensor_esq.reflection() >= 30:
+                            motor_dir.run(-450)
+                            motor_esq.run(450)
+                        break
+                    elif verde_dir >= LIMITE_VERDE and not virando:
+                        drive.straight(70)
+                        drive.turn(30)
+                        while sensor_dir.reflection() >= 30:
+                            motor_dir.run(-450)
+                            motor_esq.run(450)
+                        break
+                    elif verde_esq >= LIMITE_VERDE and not virando:
+                        drive.straight(70)
+                        drive.turn(-30)
+                        while sensor_esq.reflection() >= 30:
+                            motor_dir.run(450)
+                            motor_esq.run(-450)
+                        break
+
+        # ========== DETECÇÃO DE PRATA ==========
+        if hesquerdo in PRATA_RANGE_H and subindo_rampa == False:
+            if DEBUG:
+                print(prata_esq)
+            prata_esq += 1
+        if hdireito in PRATA_RANGE_H and subindo_rampa == False:
+            if DEBUG:
+                print(prata_dir)
+            prata_dir += 1
+        if prata_esq >= LIMITE_PRATA and prata_dir >= LIMITE_PRATA:
+            hmedia_dir = media_sensor(sensor_dir, 'h', 10, 0)
+            hmedia_esq = media_sensor(sensor_esq, 'h', 10, 0)
+            if 208 <= hmedia_esq <= 211 and 208 <= hmedia_dir <= 211:
+                resgate = True
+
+        # ========== DETECÇÃO DE VERMELHO ==========
+        if color_dir == Color.RED or color_esq == Color.RED:
+            if DEBUG:
+                print("Vermelho detectado")
+            hub.system.shutdown()
+
+        # ========== DETECÇÃO DE OBSTÁCULOS ==========
+        if distancia_ultra <= 50:
+            drive.straight(-25)
+            girar(90, True)
+            drive.straight(170)
+            girar(-90, True)
+            drive.straight(355)
+            girar(-90, True)
+            while sensor_esq.reflection() >= 30:
+                motor_dir.run(300)
+                motor_esq.run(300)
+            drive.straight(70)
+            while sensor_esq.reflection() >= 30:
+                motor_dir.run(-450)
+                motor_esq.run(450)
+            
+
+#======================================Execução======================================#
+loop_principal()
