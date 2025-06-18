@@ -1,0 +1,127 @@
+import tkinter as tk
+from tkinter import messagebox, ttk
+import sqlite3
+
+# Conectar ao banco
+conn = sqlite3.connect('rounds.db')
+cursor = conn.cursor()
+
+# Criar as tabelas se ainda não existirem
+cursor.execute('''
+    CREATE TABLE IF NOT EXISTS rounds (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        tentativa INTEGER,
+        round_number INTEGER,
+        pontos INTEGER
+    )
+''')
+
+cursor.execute('''
+    CREATE TABLE IF NOT EXISTS medias (
+        tentativa INTEGER PRIMARY KEY,
+        media REAL
+    )
+''')
+conn.commit()
+
+# Função para adicionar um round
+def adicionar_round():
+    try:
+        tentativa = int(entry_tentativa.get())
+        round_number = int(entry_round.get())
+        pontos = int(entry_pontos.get())
+
+        # Verificar se o round já existe
+        cursor.execute('SELECT * FROM rounds WHERE tentativa = ? AND round_number = ?', (tentativa, round_number))
+        if cursor.fetchone():
+            messagebox.showwarning("Erro", "Esse round já foi cadastrado para essa tentativa.")
+            return
+
+        # Inserir no banco
+        cursor.execute('INSERT INTO rounds (tentativa, round_number, pontos) VALUES (?, ?, ?)',
+                       (tentativa, round_number, pontos))
+        conn.commit()
+        messagebox.showinfo("Sucesso", "Round adicionado com sucesso!")
+
+        # Verificar se já existem 3 rounds para essa tentativa
+        cursor.execute('SELECT pontos FROM rounds WHERE tentativa = ?', (tentativa,))
+        pontos_tentativa = [linha[0] for linha in cursor.fetchall()]
+
+        if len(pontos_tentativa) == 3:
+            maiores = sorted(pontos_tentativa, reverse=True)[:2]
+            media = sum(maiores) / 2
+            cursor.execute('INSERT OR REPLACE INTO medias (tentativa, media) VALUES (?, ?)', (tentativa, media))
+            conn.commit()
+            messagebox.showinfo("Média Calculada", f"A média da tentativa {tentativa} foi calculada: {media}")
+
+        entry_tentativa.delete(0, tk.END)
+        entry_round.delete(0, tk.END)
+        entry_pontos.delete(0, tk.END)
+
+    except ValueError:
+        messagebox.showerror("Erro", "Por favor, insira valores numéricos válidos.")
+
+# Função para exibir os rounds
+def mostrar_rounds():
+    janela_rounds = tk.Toplevel(root)
+    janela_rounds.title("Lista de Rounds")
+
+    tree = ttk.Treeview(janela_rounds, columns=("Tentativa", "Round", "Pontos"), show="headings")
+    tree.heading("Tentativa", text="Tentativa")
+    tree.heading("Round", text="Round")
+    tree.heading("Pontos", text="Pontos")
+    tree.pack(fill=tk.BOTH, expand=True)
+
+    cursor.execute('SELECT tentativa, round_number, pontos FROM rounds ORDER BY tentativa, round_number')
+    for tentativa, round_number, pontos in cursor.fetchall():
+        tree.insert("", tk.END, values=(tentativa, round_number, pontos))
+
+# Função para exibir as médias
+def mostrar_medias():
+    janela_medias = tk.Toplevel(root)
+    janela_medias.title("Médias Calculadas")
+
+    tree = ttk.Treeview(janela_medias, columns=("Tentativa", "Média"), show="headings")
+    tree.heading("Tentativa", text="Tentativa")
+    tree.heading("Média", text="Média")
+    tree.pack(fill=tk.BOTH, expand=True)
+
+    cursor.execute('SELECT tentativa, media FROM medias ORDER BY tentativa')
+    for tentativa, media in cursor.fetchall():
+        tree.insert("", tk.END, values=(tentativa, media))
+
+# Criar a janela principal
+root = tk.Tk()
+root.title("Controle de Rounds e Médias")
+
+# Layout de entrada
+frame = tk.Frame(root, padx=10, pady=10)
+frame.pack()
+
+tk.Label(frame, text="Tentativa:").grid(row=0, column=0, sticky="e")
+entry_tentativa = tk.Entry(frame)
+entry_tentativa.grid(row=0, column=1)
+
+tk.Label(frame, text="Round (1, 2 ou 3):").grid(row=1, column=0, sticky="e")
+entry_round = tk.Entry(frame)
+entry_round.grid(row=1, column=1)
+
+tk.Label(frame, text="Pontos:").grid(row=2, column=0, sticky="e")
+entry_pontos = tk.Entry(frame)
+entry_pontos.grid(row=2, column=1)
+
+btn_adicionar = tk.Button(frame, text="Adicionar Round", command=adicionar_round)
+btn_adicionar.grid(row=3, column=0, columnspan=2, pady=5)
+
+# Botões extras
+btn_ver_rounds = tk.Button(frame, text="Ver Rounds", command=mostrar_rounds)
+btn_ver_rounds.grid(row=4, column=0, columnspan=2, pady=2)
+
+btn_ver_medias = tk.Button(frame, text="Ver Médias", command=mostrar_medias)
+btn_ver_medias.grid(row=5, column=0, columnspan=2, pady=2)
+
+# Rodar a aplicação
+root.mainloop()
+
+# Fechar conexão com banco quando fechar o app
+conn.close()
